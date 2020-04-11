@@ -179,6 +179,7 @@ namespace eosio { namespace chain {
             bool               genesis_written_to_block_log = false;
             block_log_preamble preamble;
 
+            block_log_impl(const fc::path& data_dir);
             inline void check_open_files() {
                if( !open_files ) {
                   reopen();
@@ -208,6 +209,9 @@ namespace eosio { namespace chain {
                   index_file.close();
                open_files = false;
             }
+
+            void construct_index();
+            uint64_t get_block_pos(uint32_t block_num);
 
             void reset( const signed_block_ptr& first_block, packed_transaction::cf_compression_type segment_compression, uint32_t first_block_num );
 
@@ -423,8 +427,7 @@ namespace {
    } // namespace
 
    block_log::block_log(const fc::path& data_dir)
-       : my(new detail::block_log_impl()) {
-      open(data_dir);
+       : my(new detail::block_log_impl(data_dir)) {
    }
 
    block_log::block_log(block_log&& other) {
@@ -432,21 +435,14 @@ namespace {
    }
 
    block_log::~block_log() {
-      if (my) {
-         flush();
-         my->close();
-         my.reset();
-      }
    }
 
-   void block_log::open(const fc::path& data_dir) {
-      my->close();
-
+   detail::block_log_impl::block_log_impl(const fc::path& data_dir) {
       if (!fc::is_directory(data_dir))
          fc::create_directories(data_dir);
 
-      my->block_file.set_file_path( data_dir / "blocks.log" );
-      my->index_file.set_file_path( data_dir / "blocks.index" );
+      block_file.set_file_path( data_dir / "blocks.log" );
+      index_file.set_file_path( data_dir / "blocks.index" );
       /* On startup of the block log, there are several states the log file and the index file can be
        * in relation to each other.
        *
@@ -465,29 +461,26 @@ namespace {
        *  - If the index file head is not in the log file, delete the index and replay.
        *  - If the index file head is in the log, but not up to date, replay from index head.
        */
-      auto log_size =  fc::exists(my->block_file.get_file_path()) ? fc::file_size( my->block_file.get_file_path() ) : 0;
-      auto index_size = fc::exists(my->index_file.get_file_path()) ? fc::file_size( my->index_file.get_file_path() ) : 0;
+      auto log_size =  fc::exists(block_file.get_file_path()) ? fc::file_size( block_file.get_file_path() ) : 0;
+      auto index_size = fc::exists(index_file.get_file_path()) ? fc::file_size( index_file.get_file_path() ) : 0;
 
       if (log_size) {
          ilog("Log is nonempty");
-         block_log_data log_data(my->block_file.get_file_path());
-         my->preamble.version = log_data.version();
-         my->preamble.first_block_num = log_data.first_block_num();
+         block_log_data log_data(block_file.get_file_path());
+         preamble.version = log_data.version();
+         preamble.first_block_num = log_data.first_block_num();
 
-         my->genesis_written_to_block_log = true; // Assume it was constructed properly.
+         genesis_written_to_block_log = true; // Assume it was constructed properly.
 
          if (index_size) {
             ilog("Index is nonempty");
             uint64_t block_pos = log_data.last_block_position();
 
-            block_log_index index(my->index_file.get_file_path());
+            block_log_index index(index_file.get_file_path());
             uint64_t        index_pos = *index.rbegin();
             
-            if (block_pos < index_pos) {
-               ilog("block_pos < index_pos, close and reopen index_file");
-               construct_index();
-            } else if (block_pos > index_pos) {
-               ilog("Index is incomplete");
+            if (block_pos != index_pos) {
+               ilog("The last block positions from blocks.log and blocks.index are different");
                construct_index();
             }
          } else {
@@ -496,12 +489,12 @@ namespace {
          }
       } else if (index_size) {
          ilog("Index is nonempty, remove and recreate it");
-         fc::remove_all( my->index_file.get_file_path() );
+         fc::remove_all( index_file.get_file_path() );
       }
 
-      my->reopen();
+      reopen();
       if (log_size)
-         my->read_head();
+         read_head();
    }
 
    uint64_t detail::block_log_impl::write_log_entry(const signed_block& b, packed_transaction::cf_compression_type segment_compression) {
@@ -551,10 +544,6 @@ namespace {
          return pos;
       }
       FC_LOG_AND_RETHROW()
-   }
-
-   void block_log::flush() {
-      my->flush();
    }
 
    void detail::block_log_impl::flush() {
@@ -630,7 +619,7 @@ namespace {
    std::unique_ptr<signed_block> block_log::read_signed_block_by_num(uint32_t block_num) const {
       try {
          std::unique_ptr<signed_block> b;
-         uint64_t pos = get_block_pos(block_num);
+         uint64_t pos = my->get_block_pos(block_num);
          if (pos != npos) {
             b = my->read_block(pos);
             EOS_ASSERT(b->block_num() == block_num, block_log_exception,
@@ -642,7 +631,7 @@ namespace {
 
    block_id_type block_log::read_block_id_by_num(uint32_t block_num) const {
       try {
-         uint64_t pos = get_block_pos(block_num);
+         uint64_t pos = my->get_block_pos(block_num);
          if (pos != npos) {
             block_header bh;
             my->read_block_header(bh, pos);
@@ -654,13 +643,12 @@ namespace {
       } FC_LOG_AND_RETHROW()
    }
 
-   uint64_t block_log::get_block_pos(uint32_t block_num) const {
-      my->check_open_files();
-      if (!(my->head && block_num <= my->head->block_num() && block_num >= my->preamble.first_block_num))
-         return npos;
-      my->index_file.seek(sizeof(uint64_t) * (block_num - my->preamble.first_block_num));
+   uint64_t detail::block_log_impl::get_block_pos(uint32_t block_num) {
+      if (!(head && block_num <= head->block_num() && block_num >= preamble.first_block_num))
+         return block_log::npos;
+      index_file.seek(sizeof(uint64_t) * (block_num - preamble.first_block_num));
       uint64_t pos;
-      my->index_file.read((char*)&pos, sizeof(pos));
+      index_file.read((char*)&pos, sizeof(pos));
       return pos;
    }
 
@@ -683,14 +671,10 @@ namespace {
       return my->preamble.first_block_num;
    }
 
-   void block_log::construct_index() {
+   void detail::block_log_impl::construct_index() {
       ilog("Reconstructing Block Log Index...");
-      my->close();
-
-      fc::remove_all( my->index_file.get_file_path() );
-      block_log::construct_index(my->block_file.get_file_path(), my->index_file.get_file_path());
-
-      my->reopen();
+      fc::remove_all(index_file.get_file_path() );
+      block_log::construct_index(block_file.get_file_path(), index_file.get_file_path());
    } // construct_index
 
    void block_log::construct_index(const fc::path& block_file_name, const fc::path& index_file_name) {
@@ -745,11 +729,9 @@ namespace {
       auto                block_num = block_header::num_from_id(id);
       auto                previous_block_num = block_header::num_from_id(header.previous);
 
-      if (previous_block_num + 1 != block_num) {
-         elog("Block ${num} (${id}) skips blocks. Previous block in block log is block ${prev_num} (${previous})",
-            ("num", previous_block_num)("id", id)("prev_num", block_header::num_from_id(previous_block_id))(
-                  "previous", previous_block_id));
-      }
+      EOS_ASSERT(previous_block_num + 1 == block_num, block_log_exception, 
+                "Block ${num} (${id}) indicates its previous block number is ${prev_num}", 
+                ("num", block_num)("id", id)("prev_num", previous_block_num));
 
       if (previous_block_id != block_id_type() && previous_block_id != header.previous) {
          elog("Block ${num} (${id}) does not link back to previous block. "
@@ -870,18 +852,13 @@ namespace {
    chain_id_type block_log::extract_chain_id( const fc::path& data_dir ) {
       return block_log_data(data_dir / "blocks.log").chain_id();
    }
-
-   bool prune(packed_transaction& ptx) {
-      ptx.prune_all();
-      return true;
-   }
    
    void block_log::prune_transactions(uint32_t block_num, const std::vector<transaction_id_type>& ids) {
       try {
 
          EOS_ASSERT(my->preamble.version >= 4, block_log_exception, 
                     "The block log version ${version} does not support transaction pruning.", ("version", my->preamble.version));
-         uint64_t pos = get_block_pos(block_num);
+         uint64_t pos = my->get_block_pos(block_num);
          EOS_ASSERT( pos != npos, block_log_exception,
                      "Specified block_num ${block_num} does not exist in block log.", ("block_num", block_num) );
 
@@ -894,7 +871,7 @@ namespace {
                      "Wrong block was read from block log.");
 
          auto pruner = overloaded{[](transaction_id_type&) { return false; },
-                                  [&ids](packed_transaction& ptx) { return  std::find(ids.begin(), ids.end(), ptx.id()) != ids.end() && prune(ptx); }};
+                                  [&ids](packed_transaction& ptx) { return  std::find(ids.begin(), ids.end(), ptx.id()) != ids.end() && (ptx.prune_all(), true); }};
 
          bool pruned = false;
          for (auto& trx : entry.transactions) {
