@@ -26,14 +26,6 @@ namespace eosio { namespace chain {
     */
    const uint32_t block_log::max_supported_version = 4;
 
-
-   template <typename T>
-   T read_buffer(const char* buf) {
-      T result;
-      memcpy(&result, buf, sizeof(T));
-      return result;
-   }
-
    struct block_log_preamble {
       uint32_t version         = 0;
       uint32_t first_block_num = 0;
@@ -48,7 +40,7 @@ namespace eosio { namespace chain {
       constexpr static int without_genesis_state_size =
           sizeof(version) + sizeof(first_block_num) + sizeof(chain_id_type) + sizeof(block_log::npos);
 
-      void read(fc::datastream<const char*>& ds) {
+      void read_from(fc::datastream<const char*>& ds) {
         ds.read((char*)&version, sizeof(version));
          EOS_ASSERT(version > 0, block_log_exception, "Block log was not setup properly");
          EOS_ASSERT(
@@ -89,7 +81,7 @@ namespace eosio { namespace chain {
       }
 
       template <typename Stream>
-      void write(Stream& ds) const {
+      void write_to(Stream& ds) const {
          EOS_ASSERT(version >= 2, block_log_exception, "this method does not support writeing block log ${version}",
                     ("version", version));
          ds.write(reinterpret_cast<const char*>(&version), sizeof(version));
@@ -108,6 +100,14 @@ namespace eosio { namespace chain {
    };
 
    namespace {
+
+      template <typename T>
+      T read_buffer(const char* buf) {
+         T result;
+         memcpy(&result, buf, sizeof(T));
+         return result;
+      }
+
       /// calculate the offset from the start of serialized block entry to block start
       int offset_to_block_start(uint32_t version) { 
          if (version < 4) return 0;
@@ -259,7 +259,7 @@ FC_REFLECT_DERIVED(eosio::chain::log_entry_v4, (eosio::chain::signed_block), (co
 
 namespace eosio { namespace chain {   
 namespace {
-   /// Provide the readonly view of blocks.log file
+   /// Provide the read only view of the blocks.log file
    class block_log_data {
       boost::iostreams::mapped_file_source file;
       block_log_preamble                   preamble;
@@ -273,7 +273,7 @@ namespace {
       fc::datastream<const char*> open(const fc::path& path) {
          file.open(path.generic_string());
          fc::datastream<const char*> ds(file.data(), file.size());
-         preamble.read(ds);
+         preamble.read_from(ds);
          first_block_pos = ds.tellp();
          return ds;
       }
@@ -331,7 +331,7 @@ namespace {
       }
    };
 
-   /// Provide the readonly view of blocks.index file
+   /// Provide the read only view of the blocks.index file
    class block_log_index {
       boost::iostreams::mapped_file_source file;
 
@@ -355,7 +355,7 @@ namespace {
       uint64_t position_at_offset(uint32_t offset) const { return *(begin() + offset); }
    };
 
-   /// Provide the readonly view for both blocks.log and blocks.index files
+   /// Provide the read only view for both blocks.log and blocks.index files
    struct block_log_archive {
       fc::path        block_file_name, index_file_name; // full pathname for blocks.log and blocks.index
       block_log_data  log_data;
@@ -378,7 +378,7 @@ namespace {
       }
    };
 
-   /// Used to traverse the block position (i.e. the last 8 bytes in each block log entry) of blocks.log file
+   /// Used to traverse the block position (i.e. the last 8 bytes in each block log entry) of the blocks.log file
    template <typename T>
    struct reverse_block_position_iterator {
       const T& data;
@@ -392,7 +392,7 @@ namespace {
       auto addr() const { return data.data() + current_position; }
 
       uint64_t get_value() {
-         if (current_position == begin_position)
+         if (current_position <= begin_position)
             return block_log::npos;
          return read_buffer<uint64_t>(addr());
       }
@@ -411,12 +411,12 @@ namespace {
    };
 
    template <typename BlockLogData>
-   reverse_block_position_iterator<BlockLogData> get_reverse_block_position_iterator(const BlockLogData& t) {
+   reverse_block_position_iterator<BlockLogData> make_reverse_block_position_iterator(const BlockLogData& t) {
       return reverse_block_position_iterator<BlockLogData>(t, t.first_block_position());
    }
 
    template <typename BlockLogData>
-   reverse_block_position_iterator<BlockLogData> get_reverse_block_position_iterator(const BlockLogData& t,
+   reverse_block_position_iterator<BlockLogData> make_reverse_block_position_iterator(const BlockLogData& t,
                                                                                      uint64_t first_block_position) {
       return reverse_block_position_iterator<BlockLogData>(t, first_block_position);
    }
@@ -572,7 +572,7 @@ namespace {
 
       preamble.version = block_log::max_supported_version; // version of 0 is invalid; it indicates that subsequent data was not properly written to the block log
       preamble.first_block_num = first_bnum;
-      preamble.write(block_file);
+      preamble.write_to(block_file);
 
       genesis_written_to_block_log = true;
       
@@ -640,13 +640,13 @@ namespace {
       } FC_LOG_AND_RETHROW()
    }
 
-   block_id_type block_log::read_block_id_by_num(uint32_t block_num)const {
+   block_id_type block_log::read_block_id_by_num(uint32_t block_num) const {
       try {
          uint64_t pos = get_block_pos(block_num);
          if (pos != npos) {
             block_header bh;
             my->read_block_header(bh, pos);
-            EOS_ASSERT(bh.block_num() == block_num, reversible_blocks_exception,
+            EOS_ASSERT(bh.block_num() == block_num, block_log_exception,
                        "Wrong block header was read from block log.", ("returned", bh.block_num())("expected", block_num));
             return bh.calculate_id();
          }
@@ -711,10 +711,10 @@ namespace {
            ("first", data.first_block_num())("last", (data.first_block_num() + num_blocks)));
 
       index_writer index(index_file_name, num_blocks);
-      auto                 iter = get_reverse_block_position_iterator(data);
-      uint32_t             blocks_found = 0;
+      uint32_t     blocks_found = 0;
 
-      for (auto iter = get_reverse_block_position_iterator(data); iter.get_value() != npos && blocks_found < num_blocks; ++iter, ++blocks_found) {
+      for (auto iter = make_reverse_block_position_iterator(data);
+           iter.get_value() != npos && blocks_found < num_blocks; ++iter, ++blocks_found) {
          index.write(iter.get_value());
       }
 
@@ -958,14 +958,11 @@ namespace {
       static_assert( block_log::max_supported_version == 4,
                      "Code was written to support format of version 4, need to update this code for latest format." );
       
-      // offset bytes to shift from old blocklog position to new blocklog position
-      const auto num_blocks_to_truncate = truncate_at_block - archive.log_data.first_block_num();
-      const uint64_t original_file_block_pos = archive.log_index.position_at_offset(num_blocks_to_truncate);
-      const uint64_t pos_delta = original_file_block_pos - block_log_preamble::without_genesis_state_size;
-
-      // all blocks to copy to the new blocklog
-      const uint64_t to_write = archive.log_data.size() - original_file_block_pos;
-      const auto new_block_file_size = to_write + block_log_preamble::without_genesis_state_size;
+      const auto     preamble_size           = block_log_preamble::without_genesis_state_size;
+      const auto     num_blocks_to_truncate  = truncate_at_block - archive.log_data.first_block_num();
+      const uint64_t first_kept_block_pos    = archive.log_index.position_at_offset(num_blocks_to_truncate);
+      const uint64_t nbytes_to_trim          = first_kept_block_pos - preamble_size;
+      const auto     new_block_file_size     = archive.log_data.size() - nbytes_to_trim;
 
       boost::iostreams::mapped_file_sink new_block_file;
       create_mapped_file(new_block_file, new_block_filename.generic_string(), new_block_file_size);
@@ -974,18 +971,18 @@ namespace {
       block_log_preamble preamble;
       preamble.version         = block_log::max_supported_version;
       preamble.first_block_num = truncate_at_block;
-      preamble.chain_context              = archive.log_data.chain_id();
-      preamble.write(ds);
+      preamble.chain_context   = archive.log_data.chain_id();
+      preamble.write_to(ds);
 
-      memcpy(new_block_file.data() + block_log_preamble::without_genesis_state_size, archive.log_data.data() + original_file_block_pos, to_write);
+      memcpy(new_block_file.data() + preamble_size, archive.log_data.data() + first_kept_block_pos, new_block_file_size - preamble_size);
 
       fc::path new_index_filename = temp_dir / "blocks.index";
       index_writer index(new_index_filename, archive.log_index.num_blocks() - num_blocks_to_truncate);
 
-      reverse_block_position_iterator<boost::iostreams::mapped_file_sink> itr(new_block_file, block_log_preamble::without_genesis_state_size);
-
-      for (; itr.get_value() != block_log::npos; ++itr) {
-         auto new_pos = itr.get_value() - pos_delta;
+      // walk along the block position of each entries and decrement each value by nbytes_to_trim
+      for (auto itr = make_reverse_block_position_iterator(new_block_file, preamble_size);
+            itr.get_value() != block_log::npos; ++itr) {
+         auto new_pos = itr.get_value() - nbytes_to_trim;
          index.write(new_pos);
          itr.set_value(new_pos);
       }
